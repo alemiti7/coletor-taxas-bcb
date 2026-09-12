@@ -3,7 +3,7 @@
 ![Go Version](https://img.shields.io/badge/Go-1.27%2B-00ADD8?style=for-the-badge&logo=go)
 ![Database](https://img.shields.io/badge/SQLite-Pure_Go-003B57?style=for-the-badge&logo=sqlite)
 ![CGO](https://img.shields.io/badge/CGO__ENABLED-0-lightgrey?style=for-the-badge)
-![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge)
 
 Aplicação concorrente escrita em **Go** para extração paralela de séries temporais da API REST do **SGS (Sistema Gerenciador de Séries Temporais) do Banco Central do Brasil**, com persistência **idempotente e incremental** em um banco SQLite local — sem CGO, sem instaladores, um único binário.
 
@@ -347,4 +347,8 @@ O banco `taxas_bcb.db` é gerado localmente e **não** é versionado.
 
 ## 📄 Licença
 
-Este projeto é disponibilizado sob a licença [MIT](LICENSE). Sinta-se à vontade para utilizar, modificar e distribuir.
+Este projeto é distribuído sob a **GNU General Public License v3.0** — veja o arquivo [`LICENSE`](./LICENSE) para o texto completo.
+
+Em resumo: você pode usar, estudar, modificar e redistribuir o código, inclusive comercialmente, desde que versões modificadas sejam também disponibilizadas sob a GPL-3.0 e mantenham os avisos de autoria. O software é fornecido **sem qualquer garantia**.
+
+Copyright (C) 2026 Alexandre Mitsuru Nikaitow
