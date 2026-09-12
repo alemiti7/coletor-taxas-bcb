@@ -6,8 +6,13 @@
 *.dylib
 bin/
 
+# Banco SQLite local e arquivos auxiliares do WAL
+taxas_bcb.db
+taxas_bcb.db-wal
+taxas_bcb.db-shm
+
 # Variáveis de ambiente
 .env
 
-# Arquivos temporários do VS Code
+# Editor
 .vscode/
