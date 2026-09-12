@@ -1,0 +1,13 @@
+# Executáveis gerados
+*.exe
+*.exe.manifest
+*.dll
+*.so
+*.dylib
+bin/
+
+# Variáveis de ambiente
+.env
+
+# Arquivos temporários do VS Code
+.vscode/
