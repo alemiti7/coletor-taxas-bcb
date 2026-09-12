@@ -1,157 +1,229 @@
-// 1. DECLARAÇÃO DO PACOTE
-// Todo arquivo Go deve começar declarando a qual pacote pertence.
-// O pacote 'main' indica que este arquivo é um ponto de entrada executável.
 package main
 
-// 2. IMPORTAÇÃO DE DEPENDÊNCIAS
-// Importamos os pacotes da biblioteca padrão do Go que serão utilizados.
 import (
-	"encoding/json" // Para converter dados JSON da API em structs Go (Unmarshal)
-	"fmt"           // Para formatação e impressão de texto no terminal (print/printf)
-	"io"            // Para leitura de streams de dados (como a resposta HTTP)
-	"net/http"      // Para realizar requisições web (GET, POST, etc.)
-	"sync"          // Fornece primitivas de sincronização, como o WaitGroup
-	"time"          // Para controlar timeouts, medir tempo de execução e lidar com datas
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	// Import do driver SQLite em Go Puro (sem CGO) com alias anônimo (_)
+	_ "github.com/glebarez/go-sqlite"
 )
 
-// 3. ESTRUTURAS DE DADOS (STRUCTS) E TAGS DE MAPEAMENTO
-// Em Go não usamos classes, usamos structs. As tags `json:"..."` informam
-// ao decodificador como mapear as chaves do JSON para os campos da struct.
-
-// TaxaBCB representa a estrutura exata de um item retornado pelo JSON da API do Banco Central.
-type TaxaBCB struct {
-	Data  string `json:"data"`  // Mapeia a chave "data" do JSON para o campo Data
-	Valor string `json:"valor"` // Mapeia a chave "valor" do JSON para o campo Valor
+// Estrutura para mapear diretamente os campos do payload JSON retornado pela API do Banco Central
+type DadoBCB struct {
+	Data  string `json:"data"`  // Data no formato "DD/MM/AAAA"
+	Valor string `json:"valor"` // Valor numérico recebido originalmente como string
 }
 
-// ResultadoTaxa é uma struct personalizada que agrupa o resultado de uma busca.
-// Ela permite trafegar tanto os dados quanto eventuais erros através de um canal.
-type ResultadoTaxa struct {
-	Nome string  // Nome amigável da taxa (ex: "SELIC")
-	Taxa TaxaBCB // A struct com os dados retornados
-	Erro error   // Armazena o erro caso ocorra uma falha (em Go, erros são valores)
+// Estrutura auxiliar para transportar os dados coletados e eventuais erros através do Channel
+type ResultadoSerie struct {
+	Codigo int       // Código numérico da série no SGS/BCB
+	Nome   string    // Identificador amigável da série (ex: SELIC, IPCA)
+	Dados  []DadoBCB // Fatia (slice) contendo os pontos históricos coletados
+	Err    error     // Captura falhas de HTTP ou Parsing isoladas por Goroutine
 }
 
-// 4. VARIÁVEIS GLOBAIS
-// Mapa no formato [chave]valor relacionando o nome da taxa ao código da série no Banco Central.
-var codigosSeries = map[string]string{
-	// Taxas de juros e inflação que você já usa
-	"SELIC": "11",  // Selic diária
-	"CDI":   "12",  // CDI diário (B3)
-	"IPCA":  "433", // IPCA mensal (%)
-
-	// Outros indicadores de inflação
-	"INPC":   "188", // INPC mensal (IBGE)
-	"IGP-M":  "189", // IGP-M mensal (FGV)
-	"IGP-DI": "190", // IGP-DI mensal (FGV)
-
-	// Taxas de juros de referência e poupança
-	"TR":       "226",   // Taxa Referencial (diária)
-	"POUPANCA": "195",   // Rendimento da Poupança (mensal)
-	"TJLP":     "256",   // Taxa de Juros de Longo Prazo (trimestral)
-	"TLP":      "27574", // Taxa de Longo Prazo (mensal)
-
-	// Câmbio / Moedas
-	"DOLAR_VENDA": "10813", // Dólar comercial (venda - fechamento)
-	"EURO_VENDA":  "21619", // Euro (venda - fechamento)
-
-	// Metas do COPOM
-	"META_SELIC": "432", // Meta da taxa Selic definida pelo COPOM (% a.a.)
-}
-
-// 5. FUNÇÃO DE BUSCA CONCORRENTE
-// Esta função faz a requisição HTTP. Ela recebe dois ponteiros/referências especiais:
-// - wg *sync.WaitGroup: Usado para notificar a função principal quando o trabalho terminar.
-// - ch chan<- ResultadoTaxa: Um canal exclusivo para envio (chan<-) dos resultados.
-func buscarTaxa(nome string, codigo string, wg *sync.WaitGroup, ch chan<- ResultadoTaxa) {
-	// 'defer' agenda a execução de uma instrução para o momento em que a função retornar.
-	// Garante que wg.Done() seja chamado ao final, mesmo que ocorra um erro antes.
-	defer wg.Done()
-
-	// Monta a URL de consulta dinâmica com base no código da série
-	url := fmt.Sprintf("https://api.bcb.gov.br/dados/serie/bcdata.sgs.%s/dados/ultimos/1?formato=json", codigo)
-
-	// Configura um cliente HTTP com tempo limite (Timeout) de 5 segundos para evitar travamentos
-	client := http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-
-	// Em Go, tratamento de erro é explícito: testamos se 'err != nil' imediatamente
-	if err != nil {
-		ch <- ResultadoTaxa{Nome: nome, Erro: fmt.Errorf("falha na requisição HTTP: %w", err)}
-		return
-	}
-	// 'defer' fecha o corpo da resposta HTTP automaticamente ao sair da função (libera memória e conexões)
-	defer resp.Body.Close()
-
-	// Valida se o servidor respondeu com código de sucesso 200 OK
-	if resp.StatusCode != http.StatusOK {
-		ch <- ResultadoTaxa{Nome: nome, Erro: fmt.Errorf("status HTTP retornado: %d", resp.StatusCode)}
-		return
-	}
-
-	// Lê todo o conteúdo textual retornado no corpo da resposta
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		ch <- ResultadoTaxa{Nome: nome, Erro: fmt.Errorf("erro ao ler o corpo da resposta: %w", err)}
-		return
-	}
-
-	// Decodifica o JSON em um slice (array dinâmico) de structs TaxaBCB
-	var taxas []TaxaBCB
-	if err := json.Unmarshal(body, &taxas); err != nil || len(taxas) == 0 {
-		ch <- ResultadoTaxa{Nome: nome, Erro: fmt.Errorf("erro ao converter JSON: %w", err)}
-		return
-	}
-
-	// Envia a struct preenchida com o sucesso para dentro do canal
-	ch <- ResultadoTaxa{Nome: nome, Taxa: taxas[0], Erro: nil}
-}
-
-// 6. FUNÇÃO PRINCIPAL (ENTRYPOINT)
 func main() {
-	// Captura o momento atual para calcular a duração total no final
+	// Dicionário (Map) expandido com as principais séries oficiais do SGS/BCB
+	series := map[int]string{
+		// Taxas de Juros e Rendimentos
+		11:   "SELIC_DIARIA",
+		432:  "SELIC_META",
+		4389: "CDI",
+		196:  "POUPANCA",
+
+		// Índices de Inflação
+		433:   "IPCA",
+		10844: "IPCA_EX", // IPCA Núcleo
+		189:   "IGP_M",
+		190:   "IGP_DI",
+		188:   "INPC",
+
+		// Câmbio e Paridades (Fechamento PTAX)
+		1:     "DOLAR_VENDA",
+		10813: "DOLAR_COMPRA",
+		21619: "EURO_VENDA",
+		21618: "EURO_COMPRA",
+
+		// Atividade Econômica e Emprego
+		24363: "IBC_BR",      // Prévia do PIB calculada pelo BCB
+		28763: "CAGED_SALDO", // Saldo de Empregos Formais
+		10777: "DESEMPREGO",  // Taxa de desocupação (PNAD)
+
+		// Setor Externo e Reservas
+		3545: "RESERVAS_INTERNACIONAIS", // Em milhões de USD
+		2270: "BALANCA_COMERCIAL",       // Saldo quinzenal/mensal em USD
+
+		// Indicadores do Setor Público
+		4649: "DIVIDA_PUBLICA_PIB", // Dívida Consolidada / PIB
+		4642: "RESULTADO_PRIMARIO", // NFSP Sem desvalorização cambial
+	}
+
 	inicio := time.Now()
 
-	// WaitGroup serve para esperar que um conjunto de goroutines termine a execução
+	// -------------------------------------------------------------------------
+	// 1. INICIALIZAÇÃO DA CONCORRÊNCIA (Goroutines + Buffer Channel)
+	// -------------------------------------------------------------------------
+
+	// Cria um canal com buffer igual à quantidade de séries para evitar bloqueio de escrita
+	ch := make(chan ResultadoSerie, len(series))
 	var wg sync.WaitGroup
 
-	// Cria um canal com buffer para trafegar dados do tipo ResultadoTaxa.
-	// O tamanho do buffer é exatamente a quantidade de taxas no mapa (evita bloqueios).
-	canalResultados := make(chan ResultadoTaxa, len(codigosSeries))
+	log.Println("Iniciando a coleta concorrente de taxas no Banco Central do Brasil...")
 
-	fmt.Println("Iniciando coleta concorrente de taxas financeiras (BCB)...")
+	// Dispara uma Goroutine paralela para cada série configurada no Map
+	for codigo, nome := range series {
+		wg.Add(1)
 
-	// 7. DISPARO DAS GOROUTINES
-	// Iteramos sobre o mapa. Para cada taxa, iniciamos uma execução em paralelo.
-	for nome, codigo := range codigosSeries {
-		wg.Add(1) // Incrementa o contador do WaitGroup em +1 para cada tarefa agendada
+		// Passagem explícita de variáveis por parâmetro para evitar problemas de escopo de loop
+		go func(cod int, n string) {
+			defer wg.Done()
 
-		// A palavra-chave 'go' inicia uma nova Goroutine (thread ultra-leve gerenciada pelo Go)
-		go buscarTaxa(nome, codigo, &wg, canalResultados)
+			// Executa a requisição HTTP para a API do BCB
+			dados, err := buscarSerieBCB(cod)
+
+			// Envia o payload encapsulado no canal
+			ch <- ResultadoSerie{
+				Codigo: cod,
+				Nome:   n,
+				Dados:  dados,
+				Err:    err,
+			}
+		}(codigo, nome)
 	}
 
-	// 8. GERENCIADOR DE FECHAMENTO DO CANAL
-	// Disparamos uma goroutine anônima encarregada de fechar o canal assim que todas as tarefas concluírem.
+	// Goroutine orquestradora: aguarda todas as requisições terminarem e fecha o canal
 	go func() {
-		wg.Wait()              // Bloqueia a execução aqui até que o contador do WaitGroup volte a zero (via wg.Done)
-		close(canalResultados) // Fecha o canal para avisar o loop de leitura que não haverá mais dados
+		wg.Wait()
+		close(ch)
 	}()
 
-	// 9. LEITURA E PROCESSAMENTO DOS RESULTADOS
-	// O loop 'range' em um canal lê os itens à medida que chegam de forma concorrente.
-	// O loop é interrompido automaticamente quando o canal é fechado (close).
-	fmt.Println("\n--- Resultados Obtidos ---")
-	for res := range canalResultados {
-		// Se a goroutine enviou um objeto com Erro preenchido, tratamos aqui
-		if res.Erro != nil {
-			fmt.Printf("[ERRO] %s: %v\n", res.Nome, res.Erro)
+	// -------------------------------------------------------------------------
+	// 2. CONEXÃO E PREPARAÇÃO DO BANCO DE DADOS SQLITE (GO PURO)
+	// -------------------------------------------------------------------------
+
+	// Abre (ou cria) o arquivo físico do banco de dados local "taxas_bcb.db"
+	db, err := sql.Open("sqlite", "taxas_bcb.db")
+	if err != nil {
+		log.Fatalf("Erro fatal ao abrir o arquivo do SQLite: %v", err)
+	}
+	defer db.Close()
+
+	// Criação da tabela com chave primária composta (codigo_serie + data) para garantir idempotência
+	queryTabela := `
+		CREATE TABLE IF NOT EXISTS taxas (
+			codigo_serie INTEGER,
+			nome_serie TEXT,
+			data TEXT,
+			valor REAL,
+			PRIMARY KEY (codigo_serie, data)
+		);
+	`
+	if _, err = db.Exec(queryTabela); err != nil {
+		log.Fatalf("Erro ao preparar a tabela 'taxas' no SQLite: %v", err)
+	}
+
+	// -------------------------------------------------------------------------
+	// 3. PROCESSAMENTO DOS RESULTADOS E PERSISTÊNCIA EM BANCO
+	// -------------------------------------------------------------------------
+
+	// O loop for-range consome os dados do canal à medida que as requisições finalizam
+	for res := range ch {
+		if res.Err != nil {
+			log.Printf("[ERRO] Falha ao consultar a série %d (%s): %v\n", res.Codigo, res.Nome, res.Err)
 			continue
 		}
 
-		// Impressão formatada dos dados recuperados
-		fmt.Printf("Taxa %-5s | Data: %s | Valor: %s%%\n", res.Nome, res.Taxa.Data, res.Taxa.Valor)
+		// Grava o lote da série no banco SQLite em bloco único via transação
+		err := salvarTaxasSQLite(db, res.Codigo, res.Nome, res.Dados)
+		if err != nil {
+			log.Printf("[ERRO] Falha ao gravar a série %d no banco: %v\n", res.Codigo, err)
+		} else {
+			fmt.Printf("✔ Série %d (%s) processada: %d registros inseridos/atualizados com sucesso.\n",
+				res.Codigo, res.Nome, len(res.Dados))
+		}
 	}
 
-	// Exibe o tempo total gasto (normalmente < 500ms devido ao paralelismo)
-	fmt.Printf("\nProcesso concluído em: %v\n", time.Since(inicio))
+	fmt.Printf("\nPipeline executado com sucesso em %v!\n", time.Since(inicio))
+}
+
+// -----------------------------------------------------------------------------
+// FUNÇÃO AUXILIAR: CONSUMO DA API REST DO BANCO CENTRAL
+// -----------------------------------------------------------------------------
+func buscarSerieBCB(codigo int) ([]DadoBCB, error) {
+	url := fmt.Sprintf("https://api.bcb.gov.br/dados/serie/bcdata.sgs.%d/dados?formato=json", codigo)
+
+	// Configuração do cliente HTTP nativo com Timeout global de proteção
+	client := http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("falha na requisição HTTP: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("resposta inválida do servidor: HTTP %d", resp.StatusCode)
+	}
+
+	// Leitura completa do corpo da resposta HTTP
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao ler stream de resposta: %w", err)
+	}
+
+	// Desserialização do payload JSON na struct Go
+	var dados []DadoBCB
+	if err := json.Unmarshal(body, &dados); err != nil {
+		return nil, fmt.Errorf("falha na conversão de JSON para Go Struct: %w", err)
+	}
+
+	return dados, nil
+}
+
+// -----------------------------------------------------------------------------
+// FUNÇÃO AUXILIAR: GRAVAÇÃO EM LOTE E UPSERT NO SQLITE
+// -----------------------------------------------------------------------------
+func salvarTaxasSQLite(db *sql.DB, codigo int, nome string, dados []DadoBCB) error {
+	// Inicia uma transação explícita para máxima velocidade de escrita (I/O)
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("erro ao iniciar transação: %w", err)
+	}
+	// Em caso de erro prematuro ou panic, a transação será desfeita com segurança
+	defer tx.Rollback()
+
+	// Statement SQL compilado com cláusula ON CONFLICT para tratar atualizações de registros já existentes
+	queryInsert := `
+		INSERT INTO taxas (codigo_serie, nome_serie, data, valor)
+		VALUES ($1, $2, $3, CAST($4 AS REAL))
+		ON CONFLICT (codigo_serie, data) DO UPDATE SET 
+			valor = EXCLUDED.valor,
+			nome_serie = EXCLUDED.nome_serie
+	`
+
+	stmt, err := tx.Prepare(queryInsert)
+	if err != nil {
+		return fmt.Errorf("erro ao preparar instrução SQL: %w", err)
+	}
+	defer stmt.Close()
+
+	// Itera sobre a lista de pontos históricos aplicando os registros na transação ativa
+	for _, d := range dados {
+		if d.Valor == "" {
+			continue // Ignora valores nulos/vazios
+		}
+
+		_, err := stmt.Exec(codigo, nome, d.Data, d.Valor)
+		if err != nil {
+			log.Printf("Aviso: falha na gravação do registro (%s - %s): %v", d.Data, d.Valor, err)
+		}
+	}
+
+	// Efetiva a gravação física dos dados no arquivo do banco de dados
+	return tx.Commit()
 }
